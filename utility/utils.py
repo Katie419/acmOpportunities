@@ -3,11 +3,10 @@ import requests
 from typing import List
 import os
 import argparse
-from time import sleep
 import json
-import google.generativeai as palm
 from bs4 import BeautifulSoup
-from opportunity import Opportunity, OpportunityType
+from utility.opportunity import Opportunity
+from utility.blocklist import BlockList
 
 # ----------------- FOR CLI LIBRARY COMMAND -----------------
 
@@ -35,6 +34,27 @@ def extract_command_value():
     arguments = parser.parse_args()
 
     return arguments
+
+
+def verify_set_env_variables() -> any:
+    """Determines if the env variables are all set properly"""
+
+    env_variables = [
+        "LINKEDIN_URL",
+        "DISCORD_WEBHOOK",
+        "DB_URI",
+        "DB_TABLE",
+        "PALM_API_KEY",
+        "GH_INTERN24_URL",
+        "LINKEDIN_INTERN_URL",
+        "PROMPTS_PATH",
+        "MESSAGE_PATH",
+    ]
+
+    # Checks to see if the env variables in env_variables
+    # all exist in the current variables
+    if not set(os.environ).issuperset(env_variables):
+        raise EnvironmentError("One or more env variables are not set.")
 
 
 def calculate_day_difference(elem: datetime) -> int:
@@ -74,23 +94,25 @@ def blueprint_opportunity_formatter(
     internship_list = []
     for elem in div:
         company = elem.find(class_=company_elem).text.strip()
-        title = elem.find(class_=title_elem).text.strip()
-        location = elem.find(class_=location_elem).text.strip()
-        link = elem.find(class_=link_elem)["href"].split("?")[0]
-        processed = 0
+        if not BlockList().is_blacklisted_company(company):
+            title = elem.find(class_=title_elem).text.strip()
+            location = elem.find(class_=location_elem).text.strip()
+            link = elem.find(class_=link_elem)["href"].split("?")[0]
+            processed = 0
 
-        date_difference = calculate_day_difference(elem)
-        if len(internship_list) < len_of_jobs:
-            if date_limit and int(days_needed_command_value) >= date_difference:
-                opportunity = Opportunity(
-                    company, title, location, link, processed, opp_type
-                )
-            else:
-                opportunity = Opportunity(
-                    company, title, location, link, processed, opp_type
-                )
+            date_difference = calculate_day_difference(elem)
 
-            internship_list.append(opportunity)
+            if len(internship_list) < len_of_jobs:
+                if date_limit and int(days_needed_command_value) >= date_difference:
+                    opportunity = Opportunity(
+                        company, title, location, link, processed, opp_type
+                    )
+                else:
+                    opportunity = Opportunity(
+                        company, title, location, link, processed, opp_type
+                    )
+
+                internship_list.append(opportunity)
 
     return internship_list
 
@@ -150,106 +172,3 @@ def determine_customized_message(message: dict) -> str:
     file_message = json.loads(message)[0]
 
     return file_message["Message"] if file_message["Message"] else default
-
-
-# ----------------- PALM API -----------------
-
-
-MAX_RETRY = 5  # Max number of retrys
-palm.configure(api_key=os.getenv("PALM_API_KEY"))
-
-
-def current_model_inuse() -> any:
-    """Returns the model in use"""
-
-    models = [
-        m
-        for m in palm.list_models()
-        if "generateText" in m.supported_generation_methods
-    ]
-
-    model = models[0].name
-
-    return model
-
-
-def parse_gpt_values(gpt_response) -> List[bool]:
-    """Helper function to parse the gpt response from a str -> List[bool]"""
-
-    response: List[bool]
-
-    for _ in range(MAX_RETRY):
-        try:
-            response = json.loads(gpt_response.lower())
-            break
-        except AttributeError:
-            sleep(0.5)
-
-    return response
-
-
-def filter_out_opportunities(list_of_opps, gpt_response) -> List[Opportunity]:
-    """Helper function for gpt_job_analyzer() to filter the data"""
-
-    structured_opps = [
-        opp for opp, response in zip(list_of_opps, gpt_response) if response
-    ]
-
-    print(f"Length after GPT analyzed the jobs: {len(structured_opps)}")
-    return structured_opps
-
-
-def get_parsed_values(prompt) -> List[bool]:
-    """Function which returns parsed values if the opportunity mathces with the clubs values"""
-
-    defaults = {
-        "model": "models/text-bison-001",
-        "temperature": 0.0,
-        "candidate_count": 1,
-        "top_k": 100,
-        "top_p": 0.95,
-        "max_output_tokens": 3072,
-        "stop_sequences": [],
-        "safety_settings": [
-            {"category": "HARM_CATEGORY_DEROGATORY", "threshold": 3},
-            {"category": "HARM_CATEGORY_TOXICITY", "threshold": 3},
-            {"category": "HARM_CATEGORY_VIOLENCE", "threshold": 3},
-            {"category": "HARM_CATEGORY_SEXUAL", "threshold": 3},
-            {"category": "HARM_CATEGORY_MEDICAL", "threshold": 3},
-            {"category": "HARM_CATEGORY_DANGEROUS", "threshold": 3},
-        ],
-    }
-
-    completion = palm.generate_text(**defaults, prompt=prompt)
-
-    parsed_values = parse_gpt_values(completion.result)
-    return parsed_values
-
-
-def gpt_job_analyze(list_of_opps: List[Opportunity], prompt: str) -> List[Opportunity]:
-    """Analyzes each job opportunity before being inserted into the DB"""
-
-    print(f"The jobs original length before filtering: {len(list_of_opps)}")
-
-    for opp in list_of_opps:
-        prompt += f"\nCompany: {opp.company}"
-        prompt += f"\nTitle: {opp.title}"
-        prompt += f"\nLocation: {opp.location}"
-        prompt += "\n"
-
-    parsed_values = []
-    for _ in range(MAX_RETRY):  # Keep looping until a valid prompt is received
-        try:
-            parsed_values = get_parsed_values(prompt)
-            break
-        except (
-            json.decoder.JSONDecodeError
-        ):  # The type of error that would be received is type JSON
-            sleep(0.5)
-
-    print(f" Below are the parsed values from GPT\n {parsed_values}")
-    print(parsed_values)  # For debugging purposes
-
-    return filter_out_opportunities(
-        list_of_opps, parsed_values
-    )  # Returns filtered out opportunities
